@@ -1,4 +1,6 @@
 # 📚 Sensor Hub Project
+![setup of the project](setup.jpg)
+
 
 ## 🎯 Overview
 This project is a comprehensive sensor hub using the Xiao ESP32S3 microcontroller. It integrates various sensors, an 8x8 WS2812 LED matrix, and a high-resolution 1.9-inch ST7789 TFT display.
