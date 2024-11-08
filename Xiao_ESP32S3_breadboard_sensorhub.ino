@@ -1,333 +1,739 @@
 #include <Wire.h>
-#include <Adafruit_GFX.h>    // Core graphics library
-#include <Adafruit_ST7789.h> // Hardware-specific library for ST7789
+#include <Adafruit_GFX.h>           // Core graphics library
+#include <Adafruit_ST7789.h>        // Hardware-specific library for ST7789
 #include <Adafruit_NeoPixel.h>
 #include <VL53L0X.h>
 #include <MPU6050.h>
 #include <Adafruit_BMP280.h>
 #include <DFRobot_ENS160.h>
 #include <Adafruit_AHTX0.h>
-#include <HardwareSerial.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
-#include <freertos/semphr.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
 
+// Pin Definitions
 #define TFT_CS   D1
 #define TFT_RST  D3
 #define TFT_DC   D2
-
 #define LED_PIN  D0
 #define NUMPIXELS 64
 
-// Initialize display and NeoPixel
+// Wi-Fi Credentials
+const char* ssid = "Triton9";
+const char* password = "88888888";
+
+// Web Server Port
+WebServer server(80);
+
+// NTP Client Setup
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 0, 60000); // UTC Time, update every 60 seconds
+
+// Initialize Display and NeoPixel
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 Adafruit_NeoPixel pixels(NUMPIXELS, LED_PIN, NEO_GRB + NEO_KHZ800);
 
-// Initialize sensors
+// Initialize Sensors
 VL53L0X vl53;
 MPU6050 mpu;
 Adafruit_BMP280 bmp;
-DFRobot_ENS160_I2C ens160(&Wire, 0x53); // Use I2C for ENS160
-Adafruit_AHTX0 aht; // Initialize AHT21 sensor
+DFRobot_ENS160_I2C ens160(&Wire, 0x53); // ENS160 I2C address
+Adafruit_AHTX0 aht;
 
-// Use HardwareSerial for GPS on ESP32
-HardwareSerial gpsSerial(1); // Use UART1 for GPS
+// Initialize GPS (Assuming GPS is connected to Serial1)
+#define gpsSerial Serial1
 
-// Create mutex for I2C bus and data access
-SemaphoreHandle_t i2c_mutex;
-SemaphoreHandle_t data_mutex;
+// Buffer Sizes
+#define BUFFER_SIZE 100
 
-// Shared sensor data
-int vl53Distance = 0;
-int16_t ax = 0, ay = 0, az = 0;
-float bmpTemp = 0, bmpPressure = 0;
-uint16_t eco2 = 0, tvoc = 0;
-float ahtTemp = 0, ahtHumidity = 0;
-String gpsData = "";
+// Data Structures for Sensor Data
+struct VL53Data {
+  unsigned long timestamp; // Epoch time
+  int distance_mm;
+  unsigned long readTime_us;
+} vl53DataBuffer[BUFFER_SIZE];
+int vl53Index = 0;
 
-// Data buffers for plots
-#define DATA_BUFFER_SIZE 170 // Width of display for plots
-float accelXData[DATA_BUFFER_SIZE] = {0};
-float accelYData[DATA_BUFFER_SIZE] = {0};
-float accelZData[DATA_BUFFER_SIZE] = {0};
-int dataIndex = 0; // Index for data buffers
+struct MPU6050Data {
+  unsigned long timestamp;
+  int16_t ax, ay, az;
+  unsigned long readTime_us;
+} mpuDataBuffer[BUFFER_SIZE];
+int mpuIndex = 0;
 
+struct BMP280Data {
+  unsigned long timestamp;
+  float temperature_C;
+  float pressure_Pa;
+  unsigned long readTime_us;
+} bmpDataBuffer[BUFFER_SIZE];
+int bmpIndex = 0;
+
+struct ENS160Data {
+  unsigned long timestamp;
+  uint16_t eco2_ppm;
+  uint16_t tvoc_ppb;
+  unsigned long readTime_us;
+} ens160DataBuffer[BUFFER_SIZE];
+int ens160Index = 0;
+
+struct AHT21Data {
+  unsigned long timestamp;
+  float temperature_C;
+  float humidity_percent;
+  unsigned long readTime_us;
+} aht21DataBuffer[BUFFER_SIZE];
+int aht21Index = 0;
+
+// Function to Scan I2C Devices
+void scanI2CDevices() {
+  Serial.println("Scanning I2C devices...");
+  byte count = 0;
+  for (byte address = 1; address < 127; address++) {
+    Wire.beginTransmission(address);
+    if (Wire.endTransmission() == 0) {
+      Serial.print("I2C device found at address 0x");
+      if (address < 16) Serial.print("0");
+      Serial.print(address, HEX);
+      Serial.println("!");
+      count++;
+    }
+  }
+  if (count == 0) {
+    Serial.println("No I2C devices found");
+  } else {
+    Serial.println("I2C scan complete");
+  }
+}
+
+// Function to Add Data to VL53 Buffer
+void addVL53Data(int distance, unsigned long readTime) {
+  vl53DataBuffer[vl53Index].timestamp = timeClient.getEpochTime();
+  vl53DataBuffer[vl53Index].distance_mm = distance;
+  vl53DataBuffer[vl53Index].readTime_us = readTime;
+  vl53Index = (vl53Index + 1) % BUFFER_SIZE;
+}
+
+// Function to Add Data to MPU6050 Buffer
+void addMPU6050Data(int16_t ax, int16_t ay, int16_t az, unsigned long readTime) {
+  mpuDataBuffer[mpuIndex].timestamp = timeClient.getEpochTime();
+  mpuDataBuffer[mpuIndex].ax = ax;
+  mpuDataBuffer[mpuIndex].ay = ay;
+  mpuDataBuffer[mpuIndex].az = az;
+  mpuDataBuffer[mpuIndex].readTime_us = readTime;
+  mpuIndex = (mpuIndex + 1) % BUFFER_SIZE;
+}
+
+// Function to Add Data to BMP280 Buffer
+void addBMP280Data(float temp, float pressure, unsigned long readTime) {
+  bmpDataBuffer[bmpIndex].timestamp = timeClient.getEpochTime();
+  bmpDataBuffer[bmpIndex].temperature_C = temp;
+  bmpDataBuffer[bmpIndex].pressure_Pa = pressure;
+  bmpDataBuffer[bmpIndex].readTime_us = readTime;
+  bmpIndex = (bmpIndex + 1) % BUFFER_SIZE;
+}
+
+// Function to Add Data to ENS160 Buffer
+void addENS160Data(uint16_t eco2, uint16_t tvoc, unsigned long readTime) {
+  ens160DataBuffer[ens160Index].timestamp = timeClient.getEpochTime();
+  ens160DataBuffer[ens160Index].eco2_ppm = eco2;
+  ens160DataBuffer[ens160Index].tvoc_ppb = tvoc;
+  ens160DataBuffer[ens160Index].readTime_us = readTime;
+  ens160Index = (ens160Index + 1) % BUFFER_SIZE;
+}
+
+// Function to Add Data to AHT21 Buffer
+void addAHT21Data(float temp, float humidity, unsigned long readTime) {
+  aht21DataBuffer[aht21Index].timestamp = timeClient.getEpochTime();
+  aht21DataBuffer[aht21Index].temperature_C = temp;
+  aht21DataBuffer[aht21Index].humidity_percent = humidity;
+  aht21DataBuffer[aht21Index].readTime_us = readTime;
+  aht21Index = (aht21Index + 1) % BUFFER_SIZE;
+}
+
+// Function to Generate JSON Data
+String getJSONData() {
+  String json = "{";
+
+  // Helper lambda to append data for each buffer
+  auto appendVL53 = [&json]() {
+    json += "\"VL53L0X_Distance_mm\":[";
+    for(int i=0; i<BUFFER_SIZE; i++) {
+      int idx = (vl53Index + i) % BUFFER_SIZE;
+      if(vl53DataBuffer[idx].timestamp == 0) continue;
+      json += "{\"timestamp\":" + String(vl53DataBuffer[idx].timestamp) + ",\"value\":" + String(vl53DataBuffer[idx].distance_mm) + "},";
+    }
+    if(json.endsWith(",")) json.remove(json.length()-1);
+    json += "],";
+  };
+
+  auto appendMPU6050 = [&json]() {
+    json += "\"MPU6050_Ax\":[";
+    for(int i=0; i<BUFFER_SIZE; i++) {
+      int idx = (mpuIndex + i) % BUFFER_SIZE;
+      if(mpuDataBuffer[idx].timestamp == 0) continue;
+      json += "{\"timestamp\":" + String(mpuDataBuffer[idx].timestamp) + ",\"value\":" + String(mpuDataBuffer[idx].ax) + "},";
+    }
+    if(json.endsWith(",")) json.remove(json.length()-1);
+    json += "],";
+
+    json += "\"MPU6050_Ay\":[";
+    for(int i=0; i<BUFFER_SIZE; i++) {
+      int idx = (mpuIndex + i) % BUFFER_SIZE;
+      if(mpuDataBuffer[idx].timestamp == 0) continue;
+      json += "{\"timestamp\":" + String(mpuDataBuffer[idx].timestamp) + ",\"value\":" + String(mpuDataBuffer[idx].ay) + "},";
+    }
+    if(json.endsWith(",")) json.remove(json.length()-1);
+    json += "],";
+
+    json += "\"MPU6050_Az\":[";
+    for(int i=0; i<BUFFER_SIZE; i++) {
+      int idx = (mpuIndex + i) % BUFFER_SIZE;
+      if(mpuDataBuffer[idx].timestamp == 0) continue;
+      json += "{\"timestamp\":" + String(mpuDataBuffer[idx].timestamp) + ",\"value\":" + String(mpuDataBuffer[idx].az) + "},";
+    }
+    if(json.endsWith(",")) json.remove(json.length()-1);
+    json += "],";
+  };
+
+  auto appendBMP280 = [&json]() {
+    json += "\"BMP280_Temp_C\":[";
+    for(int i=0; i<BUFFER_SIZE; i++) {
+      int idx = (bmpIndex + i) % BUFFER_SIZE;
+      if(bmpDataBuffer[idx].timestamp == 0) continue;
+      json += "{\"timestamp\":" + String(bmpDataBuffer[idx].timestamp) + ",\"value\":" + String(bmpDataBuffer[idx].temperature_C) + "},";
+    }
+    if(json.endsWith(",")) json.remove(json.length()-1);
+    json += "],";
+
+    json += "\"BMP280_Press_Pa\":[";
+    for(int i=0; i<BUFFER_SIZE; i++) {
+      int idx = (bmpIndex + i) % BUFFER_SIZE;
+      if(bmpDataBuffer[idx].timestamp == 0) continue;
+      json += "{\"timestamp\":" + String(bmpDataBuffer[idx].timestamp) + ",\"value\":" + String(bmpDataBuffer[idx].pressure_Pa) + "},";
+    }
+    if(json.endsWith(",")) json.remove(json.length()-1);
+    json += "],";
+  };
+
+  auto appendENS160 = [&json]() {
+    json += "\"ENS160_eCO2_ppm\":[";
+    for(int i=0; i<BUFFER_SIZE; i++) {
+      int idx = (ens160Index + i) % BUFFER_SIZE;
+      if(ens160DataBuffer[idx].timestamp == 0) continue;
+      json += "{\"timestamp\":" + String(ens160DataBuffer[idx].timestamp) + ",\"value\":" + String(ens160DataBuffer[idx].eco2_ppm) + "},";
+    }
+    if(json.endsWith(",")) json.remove(json.length()-1);
+    json += "],";
+
+    json += "\"ENS160_TVOC_ppb\":[";
+    for(int i=0; i<BUFFER_SIZE; i++) {
+      int idx = (ens160Index + i) % BUFFER_SIZE;
+      if(ens160DataBuffer[idx].timestamp == 0) continue;
+      json += "{\"timestamp\":" + String(ens160DataBuffer[idx].timestamp) + ",\"value\":" + String(ens160DataBuffer[idx].tvoc_ppb) + "},";
+    }
+    if(json.endsWith(",")) json.remove(json.length()-1);
+    json += "],";
+  };
+
+  auto appendAHT21 = [&json]() {
+    json += "\"AHT21_Temp_C\":[";
+    for(int i=0; i<BUFFER_SIZE; i++) {
+      int idx = (aht21Index + i) % BUFFER_SIZE;
+      if(aht21DataBuffer[idx].timestamp == 0) continue;
+      json += "{\"timestamp\":" + String(aht21DataBuffer[idx].timestamp) + ",\"value\":" + String(aht21DataBuffer[idx].temperature_C) + "},";
+    }
+    if(json.endsWith(",")) json.remove(json.length()-1);
+    json += "],";
+
+    json += "\"AHT21_Humidity_percent\":[";
+    for(int i=0; i<BUFFER_SIZE; i++) {
+      int idx = (aht21Index + i) % BUFFER_SIZE;
+      if(aht21DataBuffer[idx].timestamp == 0) continue;
+      json += "{\"timestamp\":" + String(aht21DataBuffer[idx].timestamp) + ",\"value\":" + String(aht21DataBuffer[idx].humidity_percent) + "},";
+    }
+    if(json.endsWith(",")) json.remove(json.length()-1);
+    json += "],";
+  };
+
+  // Append all sensor data
+  appendVL53();
+  appendMPU6050();
+  appendBMP280();
+  appendENS160();
+  appendAHT21();
+
+  // Remove trailing comma if present
+  if(json.endsWith(",")) json.remove(json.length()-1);
+  json += "}";
+
+  return json;
+}
+
+// Function to Handle Root Web Page
+void handleRoot() {
+  String html = "<!DOCTYPE html>";
+  html += "<html>";
+  html += "<head>";
+  html += "  <title>Sensor Dashboard</title>";
+  html += "  <meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "  <style>";
+  html += "    body { font-family: Arial, sans-serif; background-color: #f4f4f4; margin: 0; padding: 20px; }";
+  html += "    h1 { text-align: center; color: #333; }";
+  html += "    .sensor { background: #fff; padding: 15px; margin-bottom: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }";
+  html += "    .sensor h2 { color: #555; }";
+  html += "    svg { width: 100%; height: 200px; border: 1px solid #ddd; background-color: #fafafa; }";
+  html += "    .axis { stroke: #ccc; }";
+  html += "    .line { fill: none; stroke-width: 2px; }";
+  html += "    .line1 { stroke: #ff0000; }"; // e.g., Red for X-axis
+  html += "    .line2 { stroke: #00ff00; }"; // e.g., Green for Y-axis
+  html += "    .line3 { stroke: #0000ff; }"; // e.g., Blue for Z-axis
+  html += "  </style>";
+  html += "</head>";
+  html += "<body>";
+  html += "  <h1>Sensor Dashboard</h1>";
+
+  // Sensor Sections
+  html += "  <div class='sensor' id='vl53'>";
+  html += "    <h2>VL53L0X Distance (mm)</h2>";
+  html += "    <svg id='svg_vl53'></svg>";
+  html += "  </div>";
+
+  html += "  <div class='sensor' id='mpu6050'>";
+  html += "    <h2>MPU6050 Accelerometer (ax, ay, az)</h2>";
+  html += "    <svg id='svg_mpu6050'></svg>";
+  html += "  </div>";
+
+  html += "  <div class='sensor' id='bmp280'>";
+  html += "    <h2>BMP280 Temperature (°C) & Pressure (Pa)</h2>";
+  html += "    <svg id='svg_bmp280_temp'></svg>";
+  html += "    <svg id='svg_bmp280_press'></svg>";
+  html += "  </div>";
+
+  html += "  <div class='sensor' id='ens160'>";
+  html += "    <h2>ENS160 eCO2 (ppm) & TVOC (ppb)</h2>";
+  html += "    <svg id='svg_ens160_eco2'></svg>";
+  html += "    <svg id='svg_ens160_tvoc'></svg>";
+  html += "  </div>";
+
+  html += "  <div class='sensor' id='aht21'>";
+  html += "    <h2>AHT21 Temperature (°C) & Humidity (%)</h2>";
+  html += "    <svg id='svg_aht21_temp'></svg>";
+  html += "    <svg id='svg_aht21_humid'></svg>";
+  html += "  </div>";
+
+  // JavaScript for Fetching Data and Plotting
+  html += "  <script>";
+  html += "    async function fetchData() {";
+  html += "      try {";
+  html += "        const response = await fetch('/data');";
+  html += "        const data = await response.json();";
+  html += "        plotVL53(data.VL53L0X_Distance_mm);";
+  html += "        plotMPU6050(data.MPU6050_Ax, data.MPU6050_Ay, data.MPU6050_Az);";
+  html += "        plotBMP280Temp(data.BMP280_Temp_C);";
+  html += "        plotBMP280Press(data.BMP280_Press_Pa);";
+  html += "        plotENS160Eco2(data.ENS160_eCO2_ppm);";
+  html += "        plotENS160Tvoc(data.ENS160_TVOC_ppb);";
+  html += "        plotAHT21Temp(data.AHT21_Temp_C);";
+  html += "        plotAHT21Humid(data.AHT21_Humidity_percent);";
+  html += "      } catch(err) {";
+  html += "        console.error('Error fetching data:', err);";
+  html += "      }";
+  html += "    }";
+  html += "    setInterval(fetchData, 5000); // Fetch data every 5 seconds";
+  html += "    window.onload = fetchData;";
+
+  // Helper function to create SVG paths
+  html += "    function createPath(data, color) {";
+  html += "      const width = 800;"; // Adjust as needed
+  html += "      const height = 200;";
+  html += "      const padding = 40;";
+  html += "      let path = '';";
+  html += "      const maxTime = data[data.length -1].timestamp;";
+  html += "      const minTime = data[0].timestamp;";
+  html += "      const times = data.map(d => d.timestamp);";
+  html += "      const values = data.map(d => d.value);";
+  html += "      const minValue = Math.min(...values);";
+  html += "      const maxValue = Math.max(...values);";
+  html += "      data.forEach((point, index) => {";
+  html += "        const x = padding + ((point.timestamp - minTime) / (maxTime - minTime)) * (width - 2 * padding);";
+  html += "        const y = height - padding - ((point.value - minValue) / (maxValue - minValue)) * (height - 2 * padding);";
+  html += "        if(index === 0) {";
+  html += "          path += `M ${x} ${y} `;";
+  html += "        } else {";
+  html += "          path += `L ${x} ${y} `;";
+  html += "        }";
+  html += "      });";
+  html += "      return `<path d='${path}' stroke='${color}' class='line' />`;";
+  html += "    }";
+
+  // Plot Functions
+  html += "    function plotVL53(data) {";
+  html += "      const svg = document.getElementById('svg_vl53');";
+  html += "      if(data.length === 0) { svg.innerHTML = ''; return; }";
+  html += "      const path = createPath(data, '#ff0000');"; // Red color
+  html += "      svg.innerHTML = path;";
+  html += "    }";
+
+  html += "    function plotMPU6050(ax, ay, az) {";
+  html += "      const svg = document.getElementById('svg_mpu6050');";
+  html += "      if(ax.length === 0) { svg.innerHTML = ''; return; }";
+  html += "      let path = '';";
+  html += "      const width = 800;";
+  html += "      const height = 200;";
+  html += "      const padding = 40;";
+  html += "      const maxTime = ax[ax.length -1].timestamp;";
+  html += "      const minTime = ax[0].timestamp;";
+  html += "      const axValues = ax.map(d => d.value);";
+  html += "      const ayValues = ay.map(d => d.value);";
+  html += "      const azValues = az.map(d => d.value);";
+  html += "      const minValue = Math.min(...axValues, ...ayValues, ...azValues);";
+  html += "      const maxValue = Math.max(...axValues, ...ayValues, ...azValues);";
+  html += "      // Ax";
+  html += "      let pathAx = 'M ';";
+  html += "      ax.forEach((point, index) => {";
+  html += "        const x = padding + ((point.timestamp - minTime) / (maxTime - minTime)) * (width - 2 * padding);";
+  html += "        const y = height - padding - ((point.value - minValue) / (maxValue - minValue)) * (height - 2 * padding);";
+  html += "        if(index === 0) { pathAx += `${x} ${y} `; }";
+  html += "        else { pathAx += `L ${x} ${y} `; }";
+  html += "      });";
+  html += "      // Ay";
+  html += "      let pathAy = 'M ';";
+  html += "      ay.forEach((point, index) => {";
+  html += "        const x = padding + ((point.timestamp - minTime) / (maxTime - minTime)) * (width - 2 * padding);";
+  html += "        const y = height - padding - ((point.value - minValue) / (maxValue - minValue)) * (height - 2 * padding);";
+  html += "        if(index === 0) { pathAy += `${x} ${y} `; }";
+  html += "        else { pathAy += `L ${x} ${y} `; }";
+  html += "      });";
+  html += "      // Az";
+  html += "      let pathAz = 'M ';";
+  html += "      az.forEach((point, index) => {";
+  html += "        const x = padding + ((point.timestamp - minTime) / (maxTime - minTime)) * (width - 2 * padding);";
+  html += "        const y = height - padding - ((point.value - minValue) / (maxValue - minValue)) * (height - 2 * padding);";
+  html += "        if(index === 0) { pathAz += `${x} ${y} `; }";
+  html += "        else { pathAz += `L ${x} ${y} `; }";
+  html += "      });";
+  html += "      svg.innerHTML = `<path d='${pathAx}' stroke='#ff0000' class='line line1' /><path d='${pathAy}' stroke='#00ff00' class='line line2' /><path d='${pathAz}' stroke='#0000ff' class='line line3' />`;";
+  html += "    }";
+
+  html += "    function plotBMP280Temp(data) {";
+  html += "      const svg = document.getElementById('svg_bmp280_temp');";
+  html += "      if(data.length === 0) { svg.innerHTML = ''; return; }";
+  html += "      const path = createPath(data, '#ffa500');"; // Orange color
+  html += "      svg.innerHTML = path;";
+  html += "    }";
+
+  html += "    function plotBMP280Press(data) {";
+  html += "      const svg = document.getElementById('svg_bmp280_press');";
+  html += "      if(data.length === 0) { svg.innerHTML = ''; return; }";
+  html += "      const path = createPath(data, '#800080');"; // Purple color
+  html += "      svg.innerHTML = path;";
+  html += "    }";
+
+  html += "    function plotENS160Eco2(data) {";
+  html += "      const svg = document.getElementById('svg_ens160_eco2');";
+  html += "      if(data.length === 0) { svg.innerHTML = ''; return; }";
+  html += "      const path = createPath(data, '#00ffff');"; // Cyan color
+  html += "      svg.innerHTML = path;";
+  html += "    }";
+
+  html += "    function plotENS160Tvoc(data) {";
+  html += "      const svg = document.getElementById('svg_ens160_tvoc');";
+  html += "      if(data.length === 0) { svg.innerHTML = ''; return; }";
+  html += "      const path = createPath(data, '#ff00ff');"; // Magenta color
+  html += "      svg.innerHTML = path;";
+  html += "    }";
+
+  html += "    function plotAHT21Temp(data) {";
+  html += "      const svg = document.getElementById('svg_aht21_temp');";
+  html += "      if(data.length === 0) { svg.innerHTML = ''; return; }";
+  html += "      const path = createPath(data, '#008000');"; // Green color
+  html += "      svg.innerHTML = path;";
+  html += "    }";
+
+  html += "    function plotAHT21Humid(data) {";
+  html += "      const svg = document.getElementById('svg_aht21_humid');";
+  html += "      if(data.length === 0) { svg.innerHTML = ''; return; }";
+  html += "      const path = createPath(data, '#000080');"; // Navy color
+  html += "      svg.innerHTML = path;";
+  html += "    }";
+  
+  html += "  </script>";
+  html += "</body>";
+  html += "</html>";
+
+  server.send(200, "text/html", html);
+}
+
+// Setup Function
 void setup() {
+  // Initialize Serial Communication
   Serial.begin(115200);
   Wire.begin();
 
-  // Create mutexes
-  i2c_mutex = xSemaphoreCreateMutex();
-  data_mutex = xSemaphoreCreateMutex();
+  // Initialize GPS Serial (Assuming GPS is connected to Serial1)
+  gpsSerial.begin(9600);
+
+  // Scan for I2C Devices
+  scanI2CDevices();
 
   // Initialize NeoPixel
   pixels.begin();
   pixels.setBrightness(10); // Set brightness to a lower value
   pixels.clear();
+  pixels.setPixelColor(0, pixels.Color(0, 0, 255)); // Indicate Device is On
   pixels.show();
 
-  // Initialize TFT
+  // Initialize TFT Display
   tft.init(170, 320); // Initialize with width and height
   tft.setRotation(2); // Rotate display anticlockwise by 90 degrees
   tft.fillScreen(ST77XX_BLACK);
+  pixels.setPixelColor(2, pixels.Color(0, 255, 0)); // Indicate TFT initialized
+  pixels.show();
   Serial.println("TFT initialized");
 
-  // Initialize VL53L0X
-  if (xSemaphoreTake(i2c_mutex, portMAX_DELAY)) {
-    if (vl53.init()) {
-      Serial.println("VL53L0X initialized");
-    } else {
-      Serial.println("VL53L0X initialization failed");
-    }
-    xSemaphoreGive(i2c_mutex);
+  // Initialize VL53L0X Sensor
+  if (vl53.init()) {
+    pixels.setPixelColor(3, pixels.Color(0, 255, 0)); // VL53L0X works
+    Serial.println("VL53L0X initialized");
+  } else {
+    pixels.setPixelColor(3, pixels.Color(255, 0, 0)); // VL53L0X failed
+    Serial.println("VL53L0X initialization failed");
   }
+  pixels.show();
 
-  // Initialize MPU6050
-  if (xSemaphoreTake(i2c_mutex, portMAX_DELAY)) {
-    mpu.initialize();
-    if (mpu.testConnection()) {
-      Serial.println("MPU6050 initialized");
-    } else {
-      Serial.println("MPU6050 initialization failed");
-    }
-    xSemaphoreGive(i2c_mutex);
+  // Initialize MPU6050 Sensor
+  mpu.initialize();
+  if (mpu.testConnection()) {
+    pixels.setPixelColor(4, pixels.Color(0, 255, 0)); // MPU6050 works
+    Serial.println("MPU6050 initialized");
+  } else {
+    pixels.setPixelColor(4, pixels.Color(255, 0, 0)); // MPU6050 failed
+    Serial.println("MPU6050 initialization failed");
   }
+  pixels.show();
 
-  // Initialize BMP280
-  if (xSemaphoreTake(i2c_mutex, portMAX_DELAY)) {
-    if (bmp.begin(0x76)) {
-      Serial.println("BMP280 initialized at 0x76");
-    } else if (bmp.begin(0x77)) {
-      Serial.println("BMP280 initialized at 0x77");
-    } else {
-      Serial.println("BMP280 initialization failed");
-    }
-    xSemaphoreGive(i2c_mutex);
+  // Initialize BMP280 Sensor
+  if (bmp.begin(0x76)) {
+    pixels.setPixelColor(5, pixels.Color(0, 255, 0)); // BMP280 works
+    Serial.println("BMP280 initialized at 0x76");
+  } else if (bmp.begin(0x77)) {
+    pixels.setPixelColor(5, pixels.Color(0, 255, 0)); // BMP280 works
+    Serial.println("BMP280 initialized at 0x77");
+  } else {
+    pixels.setPixelColor(5, pixels.Color(255, 0, 0)); // BMP280 failed
+    Serial.println("BMP280 initialization failed");
   }
+  pixels.show();
 
-  // Initialize ENS160
-  if (xSemaphoreTake(i2c_mutex, portMAX_DELAY)) {
-    while (ens160.begin() != NO_ERR) {
-      Serial.println("Communication with ENS160 failed, retrying...");
-      delay(3000);
-    }
-    Serial.println("ENS160 initialized successfully!");
-    xSemaphoreGive(i2c_mutex);
+  // Initialize ENS160 Sensor
+  while (ens160.begin() != NO_ERR) {
+    Serial.println("Communication with ENS160 failed, retrying...");
+    pixels.setPixelColor(6, pixels.Color(255, 0, 0)); // ENS160 failed
+    pixels.show();
+    delay(3000);
   }
+  Serial.println("ENS160 initialized successfully!");
+  pixels.setPixelColor(6, pixels.Color(0, 255, 0)); // ENS160 works
+  pixels.show();
 
-  // Initialize AHT21
-  if (xSemaphoreTake(i2c_mutex, portMAX_DELAY)) {
-    if (aht.begin()) {
-      Serial.println("AHT21 initialized successfully!");
-    } else {
-      Serial.println("AHT21 initialization failed");
-    }
-    xSemaphoreGive(i2c_mutex);
+  // Initialize AHT21 Sensor
+  if (aht.begin()) {
+    pixels.setPixelColor(7, pixels.Color(0, 255, 0)); // AHT21 works
+    Serial.println("AHT21 initialized successfully!");
+  } else {
+    pixels.setPixelColor(7, pixels.Color(255, 0, 0)); // AHT21 failed
+    Serial.println("AHT21 initialization failed");
   }
+  pixels.show();
 
-  // Initialize GPS
-  gpsSerial.begin(9600);
-  Serial.println("GPS initialized");
+  // Connect to Wi-Fi
+  WiFi.begin(ssid, password);
+  pixels.setPixelColor(1, pixels.Color(255, 255, 0)); // Indicate Wi-Fi Connecting
+  pixels.show();
+  Serial.print("Connecting to Wi-Fi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWi-Fi connected");
+  pixels.setPixelColor(1, pixels.Color(0, 255, 0)); // Indicate Wi-Fi connected
+  pixels.show();
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
 
-  // Create tasks
-  xTaskCreate(vl53Task, "VL53L0X Task", 2048, NULL, 1, NULL);
-  xTaskCreate(mpuTask, "MPU6050 Task", 2048, NULL, 1, NULL);
-  xTaskCreate(bmpTask, "BMP280 Task", 2048, NULL, 1, NULL);
-  xTaskCreate(ensTask, "ENS160 Task", 2048, NULL, 1, NULL);
-  xTaskCreate(ahtTask, "AHT21 Task", 2048, NULL, 1, NULL);
-  xTaskCreate(gpsTask, "GPS Task", 4096, NULL, 1, NULL);
-  xTaskCreate(displayTask, "Display Task", 8192, NULL, 1, NULL);
+  // Initialize NTP Client
+  timeClient.begin();
+  while(!timeClient.update()) {
+    timeClient.forceUpdate();
+  }
+  Serial.println("Time synchronized via NTP");
+
+  // Initialize Web Server Routes
+  server.on("/", handleRoot);
+  server.on("/data", HTTP_GET, [](){
+    String json = getJSONData();
+    server.send(200, "application/json", json);
+  });
+
+  // Start Web Server
+  server.begin();
+  Serial.println("HTTP server started");
 }
 
+// Function to Clear Specific Line on TFT
+void clearLine(int y) {
+  tft.fillRect(0, y, tft.width(), 20, ST77XX_BLACK); // Assuming 20 pixels height per line
+}
+
+// Function to Display Header on TFT
+void displayHeader(const char* header, uint16_t color) {
+  tft.setTextColor(color, ST77XX_BLACK);
+  tft.setTextSize(2);
+  int y = 0;
+  clearLine(y);
+  clearLine(y + 10);
+  tft.setCursor(0, y);
+  tft.println(header);
+  tft.drawLine(0, y + 30, tft.width(), y + 30, color); // Adjust as needed
+}
+
+// Function to Display Value on TFT
+void displayValue(const char* label, String value, uint16_t color, int y) {
+  clearLine(y);
+  tft.setTextColor(color, ST77XX_BLACK);
+  tft.setTextSize(1);
+  tft.setCursor(0, y);
+  tft.print(label);
+  tft.print(": ");
+  tft.print(value);
+
+  // Append spaces to clear remaining part of the line
+  String displayStr = label + String(": ") + value;
+  while (displayStr.length() < 20) { // Adjust based on display width
+    displayStr += " ";
+  }
+  tft.setCursor(0, y);
+  tft.print(displayStr.substring(0, 20));
+}
+
+// Loop Function
 void loop() {
-  // Empty loop since tasks handle everything
-}
+  server.handleClient();
 
-// Task to read VL53L0X sensor
-void vl53Task(void *pvParameters) {
-  if (xSemaphoreTake(i2c_mutex, portMAX_DELAY)) {
-    if (!vl53.init()) {
-      Serial.println("Failed to initialize VL53L0X");
-      xSemaphoreGive(i2c_mutex);
-      vTaskDelete(NULL);
-    }
-    xSemaphoreGive(i2c_mutex);
+  // Display Header
+  displayHeader("Sensor Dashboard", ST77XX_CYAN);
+
+  int currentY = 40; // Starting Y position after header
+
+  // Read VL53L0X Sensor
+  unsigned long vl53StartTime = micros();
+  int vl53Distance = vl53.readRangeSingleMillimeters();
+  unsigned long vl53ReadTime = micros() - vl53StartTime;
+  addVL53Data(vl53Distance > 0 ? vl53Distance : -1, vl53ReadTime);
+  displayValue("VL53L0X", String(vl53Distance > 0 ? vl53Distance : -1) + " mm", ST77XX_GREEN, currentY);
+  currentY += 20;
+  displayValue("Read Time", String(vl53ReadTime) + " µs", ST77XX_GREEN, currentY);
+  currentY += 20;
+  Serial.print("VL53L0X Distance: ");
+  Serial.println(vl53Distance > 0 ? vl53Distance : -1);
+
+  // Read MPU6050 Sensor
+  unsigned long mpuStartTime = micros();
+  int16_t ax, ay, az;
+  mpu.getAcceleration(&ax, &ay, &az);
+  unsigned long mpuReadTime = micros() - mpuStartTime;
+  addMPU6050Data(ax, ay, az, mpuReadTime);
+  displayValue("MPU6050", "(" + String(ax) + ", " + String(ay) + ", " + String(az) + ")", ST77XX_CYAN, currentY);
+  currentY += 20;
+  displayValue("Read Time", String(mpuReadTime) + " µs", ST77XX_CYAN, currentY);
+  currentY += 20;
+  Serial.print("MPU6050 Accel: (");
+  Serial.print(ax);
+  Serial.print(", ");
+  Serial.print(ay);
+  Serial.print(", ");
+  Serial.println(az);
+
+  // Read BMP280 Sensor
+  unsigned long bmpStartTime = micros();
+  float bmpTemp = bmp.readTemperature();
+  float bmpPressure = bmp.readPressure() / 100.0F; // Convert Pa to hPa for readability
+  unsigned long bmpReadTime = micros() - bmpStartTime;
+  addBMP280Data(bmpTemp, bmpPressure, bmpReadTime);
+  displayValue("BMP280 Temp", String(bmpTemp) + " °C", ST77XX_YELLOW, currentY);
+  currentY += 20;
+  displayValue("BMP280 Press", String(bmpPressure) + " hPa", ST77XX_YELLOW, currentY);
+  currentY += 20;
+  displayValue("Read Time", String(bmpReadTime) + " µs", ST77XX_YELLOW, currentY);
+  currentY += 20;
+  Serial.print("BMP280 Temp: ");
+  Serial.println(bmpTemp);
+  Serial.print("BMP280 Pressure: ");
+  Serial.println(bmpPressure);
+
+  // Read ENS160 Sensor
+  unsigned long ens160StartTime = micros();
+  uint16_t eco2 = ens160.getECO2();
+  uint16_t tvoc = ens160.getTVOC();
+  unsigned long ens160ReadTime = micros() - ens160StartTime;
+  addENS160Data(eco2, tvoc, ens160ReadTime);
+  displayValue("ENS160 eCO2", String(eco2) + " ppm", ST77XX_MAGENTA, currentY);
+  currentY += 20;
+  displayValue("ENS160 TVOC", String(tvoc) + " ppb", ST77XX_MAGENTA, currentY);
+  currentY += 20;
+  displayValue("Read Time", String(ens160ReadTime) + " µs", ST77XX_MAGENTA, currentY);
+  currentY += 20;
+  Serial.print("ENS160 eCO2: ");
+  Serial.println(eco2);
+  Serial.print("ENS160 TVOC: ");
+  Serial.println(tvoc);
+
+  // Read AHT21 Sensor
+  unsigned long ahtStartTime = micros();
+  sensors_event_t humidity, temp;
+  aht.getEvent(&humidity, &temp);
+  unsigned long ahtReadTime = micros() - ahtStartTime;
+  if (!isnan(temp.temperature)) {
+    addAHT21Data(temp.temperature, humidity.relative_humidity, ahtReadTime);
+    displayValue("AHT21 Temp", String(temp.temperature) + " °C", ST77XX_BLUE, currentY);
+    currentY += 20;
+    displayValue("AHT21 Humid", String(humidity.relative_humidity) + " %", ST77XX_BLUE, currentY);
+  } else {
+    addAHT21Data(-1, -1, ahtReadTime);
+    displayValue("AHT21 Temp", "N/A", ST77XX_BLUE, currentY);
+    currentY += 20;
+    displayValue("AHT21 Humid", "N/A", ST77XX_BLUE, currentY);
   }
-  while (1) {
-    if (xSemaphoreTake(i2c_mutex, portMAX_DELAY)) {
-      vl53Distance = vl53.readRangeSingleMillimeters();
-      xSemaphoreGive(i2c_mutex);
-    }
-    vTaskDelay(pdMS_TO_TICKS(100));
+  currentY += 20;
+  displayValue("Read Time", String(ahtReadTime) + " µs", ST77XX_BLUE, currentY);
+  currentY += 20;
+  Serial.print("AHT21 Temp: ");
+  Serial.println(!isnan(temp.temperature) ? temp.temperature : -1);
+  Serial.print("AHT21 Humidity: ");
+  Serial.println(!isnan(humidity.relative_humidity) ? humidity.relative_humidity : -1);
+
+  // Read GPS Data
+  unsigned long gpsStartTime = micros();
+  String gpsData = "NA";
+  if (gpsSerial.available()) {
+    gpsData = gpsSerial.readStringUntil('\n');
+    gpsData.trim(); // Remove any trailing newline or carriage return
+    Serial.print("GPS Data: ");
+    Serial.println(gpsData);
+  } else {
+    Serial.println("GPS Data: NA");
   }
-}
+  unsigned long gpsReadTime = micros() - gpsStartTime;
+  displayValue("GPS Data", gpsData, ST77XX_WHITE, currentY);
+  currentY += 20;
+  displayValue("Read Time", String(gpsReadTime) + " µs", ST77XX_WHITE, currentY);
+  currentY += 20;
 
-// Task to read MPU6050 sensor
-void mpuTask(void *pvParameters) {
-  while (1) {
-    if (xSemaphoreTake(i2c_mutex, portMAX_DELAY)) {
-      mpu.getAcceleration(&ax, &ay, &az);
-      xSemaphoreGive(i2c_mutex);
-    }
-    if (xSemaphoreTake(data_mutex, portMAX_DELAY)) {
-      accelXData[dataIndex] = ax;
-      accelYData[dataIndex] = ay;
-      accelZData[dataIndex] = az;
-      dataIndex = (dataIndex + 1) % DATA_BUFFER_SIZE;
-      xSemaphoreGive(data_mutex);
-    }
-    vTaskDelay(pdMS_TO_TICKS(100));
-  }
-}
+  // Update NeoPixel Status
+  pixels.show();
 
-// Task to read BMP280 sensor
-void bmpTask(void *pvParameters) {
-  while (1) {
-    if (xSemaphoreTake(i2c_mutex, portMAX_DELAY)) {
-      bmpTemp = bmp.readTemperature();
-      bmpPressure = bmp.readPressure();
-      xSemaphoreGive(i2c_mutex);
-    }
-    vTaskDelay(pdMS_TO_TICKS(1000));
-  }
-}
-
-// Task to read ENS160 sensor
-void ensTask(void *pvParameters) {
-  while (1) {
-    if (xSemaphoreTake(i2c_mutex, portMAX_DELAY)) {
-      ens160.setPWRMode(ENS160_STANDARD_MODE);
-      eco2 = ens160.getECO2();
-      tvoc = ens160.getTVOC();
-      xSemaphoreGive(i2c_mutex);
-    }
-    vTaskDelay(pdMS_TO_TICKS(1000));
-  }
-}
-
-// Task to read AHT21 sensor
-void ahtTask(void *pvParameters) {
-  sensors_event_t humidityEvent, tempEvent;
-  while (1) {
-    if (xSemaphoreTake(i2c_mutex, portMAX_DELAY)) {
-      aht.getEvent(&humidityEvent, &tempEvent);
-      ahtTemp = tempEvent.temperature;
-      ahtHumidity = humidityEvent.relative_humidity;
-      xSemaphoreGive(i2c_mutex);
-    }
-    vTaskDelay(pdMS_TO_TICKS(1000));
-  }
-}
-
-// Task to read GPS data
-void gpsTask(void *pvParameters) {
-  while (1) {
-    if (gpsSerial.available()) {
-      String tempData = gpsSerial.readStringUntil('\n');
-      if (xSemaphoreTake(data_mutex, portMAX_DELAY)) {
-        gpsData = tempData;
-        xSemaphoreGive(data_mutex);
-      }
-    }
-    vTaskDelay(pdMS_TO_TICKS(500));
-  }
-}
-
-// Display task
-void displayTask(void *pvParameters) {
-  int prevIndex = dataIndex;
-  while (1) {
-    if (prevIndex != dataIndex) {
-      prevIndex = dataIndex;
-
-      tft.startWrite();
-
-      // Accelerometer Plot
-      tft.fillRect(0, 0, 170, 80, ST77XX_BLACK);
-      tft.drawRect(0, 0, 170, 80, ST77XX_WHITE);
-      tft.setCursor(5, 5);
-      tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
-      tft.setTextSize(1);
-      tft.print("Accelerometer (X,Y,Z)");
-
-      if (xSemaphoreTake(data_mutex, portMAX_DELAY)) {
-        for (int i = 1; i < DATA_BUFFER_SIZE; i++) {
-          int x1 = i - 1;
-          int x2 = i;
-          int idx1 = (dataIndex + i - 1) % DATA_BUFFER_SIZE;
-          int idx2 = (dataIndex + i) % DATA_BUFFER_SIZE;
-
-          int y1_x = 40 - (accelXData[idx1] / 32768.0) * 40;
-          int y2_x = 40 - (accelXData[idx2] / 32768.0) * 40;
-          int y1_y = 40 - (accelYData[idx1] / 32768.0) * 40;
-          int y2_y = 40 - (accelYData[idx2] / 32768.0) * 40;
-          int y1_z = 40 - (accelZData[idx1] / 32768.0) * 40;
-          int y2_z = 40 - (accelZData[idx2] / 32768.0) * 40;
-
-          tft.drawLine(x1, y1_x, x2, y2_x, ST77XX_RED);
-          tft.drawLine(x1, y1_y, x2, y2_y, ST77XX_GREEN);
-          tft.drawLine(x1, y1_z, x2, y2_z, ST77XX_BLUE);
-        }
-        // Current values
-        tft.setCursor(5, 65);
-        tft.setTextColor(ST77XX_RED, ST77XX_BLACK);
-        tft.printf("X: %d  ", ax);
-        tft.setTextColor(ST77XX_GREEN, ST77XX_BLACK);
-        tft.printf("Y: %d  ", ay);
-        tft.setTextColor(ST77XX_BLUE, ST77XX_BLACK);
-        tft.printf("Z: %d", az);
-        xSemaphoreGive(data_mutex);
-      }
-
-      // BMP280 Data
-      tft.fillRect(0, 85, 170, 40, ST77XX_BLACK);
-      tft.drawRect(0, 85, 170, 40, ST77XX_WHITE);
-      tft.setCursor(5, 90);
-      tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
-      tft.print("BMP280 Temp & Pressure");
-      tft.setCursor(5, 105);
-      tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
-      tft.printf("Temp: %.2f C", bmpTemp);
-      tft.setCursor(5, 120);
-      tft.printf("Pressure: %.2f hPa", bmpPressure / 100.0);
-
-      // ENS160 Data
-      tft.fillRect(0, 130, 170, 40, ST77XX_BLACK);
-      tft.drawRect(0, 130, 170, 40, ST77XX_WHITE);
-      tft.setCursor(5, 135);
-      tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
-      tft.print("ENS160 Air Quality");
-      tft.setCursor(5, 150);
-      tft.printf("eCO2: %d ppm", eco2);
-      tft.setCursor(5, 165);
-      tft.printf("TVOC: %d ppb", tvoc);
-
-      // AHT21 Data
-      tft.fillRect(0, 175, 170, 40, ST77XX_BLACK);
-      tft.drawRect(0, 175, 170, 40, ST77XX_WHITE);
-      tft.setCursor(5, 180);
-      tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
-      tft.print("AHT21 Temp & Humidity");
-      tft.setCursor(5, 195);
-      tft.printf("Temp: %.2f C", ahtTemp);
-      tft.setCursor(5, 210);
-      tft.printf("Humidity: %.2f %%", ahtHumidity);
-
-      // GPS Data
-      tft.fillRect(0, 220, 170, 60, ST77XX_BLACK);
-      tft.drawRect(0, 220, 170, 60, ST77XX_WHITE);
-      tft.setCursor(5, 225);
-      tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
-      tft.print("GPS Coordinates");
-      if (xSemaphoreTake(data_mutex, portMAX_DELAY)) {
-        tft.setCursor(5, 240);
-        tft.print(gpsData);
-        xSemaphoreGive(data_mutex);
-      }
-
-      tft.endWrite();
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(100));
-  }
+  // Small Delay to Prevent Overloading
+  //delay(1000);
 }
