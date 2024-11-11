@@ -1,5 +1,5 @@
 # 📚 Sensor Hub Project
-![setup of the project](setup.jpg)
+![working](setup.jpg)
 
 
 ## 🎯 Overview
