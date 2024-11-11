@@ -1,5 +1,5 @@
 # 📚 Sensor Hub Project
-![working](setup.jpg)
+![working](https://github.com/ajinkyagorad/ArduinoSensorhub/blob/ebeee03ea8cb49a070fc15688e30c65e97f7ba0e/setup.jpg)
 
 
 ## 🎯 Overview
